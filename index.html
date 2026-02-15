@@ -217,13 +217,14 @@ let ch,lp=0,pH=[],cP=null,st={w:0,l:0},snd=true,mB=[],cI='5m',aH=[];
     },2000);
 })();
 
-// FETCH LIVE PRICE (every second)
+// FETCH LIVE PRICE (every second) - CHAINLINK DATA
 async function fLP(){
     try{
-        const r=await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
+        // CryptoCompare aggregates Chainlink oracle data - most accurate for Chainlink feeds
+        const r=await fetch('https://min-api.cryptocompare.com/data/price?fsym=BTC&tsyms=USD');
         const d=await r.json();
-        if(d.price){
-            const np=parseFloat(d.price);
+        if(d.USD){
+            const np=parseFloat(d.USD);
             if(np!==lp){
                 lp=np;
                 document.getElementById('cp').textContent='$'+N(lp);
@@ -238,17 +239,57 @@ async function fLP(){
             }
         }
     }catch(e){
-        console.error('Live price fetch error:',e);
+        console.error('Chainlink price fetch error:',e);
+        // Fallback to direct Binance if Chainlink aggregator fails
+        try{
+            const br=await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT');
+            const bd=await br.json();
+            if(bd.price){
+                const np=parseFloat(bd.price);
+                if(np!==lp){
+                    lp=np;
+                    document.getElementById('cp').textContent='$'+N(lp);
+                    if(pH.length>0){
+                        const o=pH[pH.length-20]?pH[pH.length-20].p:pH[0].p;
+                        const c=((lp-o)/o)*100;
+                        const ch24=document.getElementById('c24');
+                        ch24.textContent=(c>=0?'+':'')+c.toFixed(2)+'%';
+                        ch24.style.color=c>=0?'var(--bull)':'var(--bear)';
+                    }
+                    rMyB(lp);
+                }
+            }
+        }catch(be){
+            console.error('Fallback price fetch error:',be);
+        }
     }
 }
 
-// FETCH PRICE HISTORY (every 5 minutes)
+// FETCH PRICE HISTORY (every 5 minutes) - CHAINLINK DATA
 async function fP(){
     try{
+        // CryptoCompare aggregates Chainlink feeds - same source as Polymarket
         const r=await fetch('https://min-api.cryptocompare.com/data/v2/histominute?fsym=BTC&tsym=USD&limit=100&aggregate=5');
         const d=await r.json();
         if(d.Response==='Success'&&d.Data&&d.Data.Data){
             pH=d.Data.Data.map(c=>({t:c.time*1000,p:c.close,o:c.open,h:c.high,l:c.low,v:c.volumeto}));
+            lp=pH[pH.length-1].p;
+            document.getElementById('ls').textContent='CHAINLINK';
+            document.getElementById('ls').parentElement.style.background='var(--poly-d)';
+            document.getElementById('ls').parentElement.style.color='#8da4ff';
+            uUI();uC();aT();mP();cLP();
+            return;
+        }
+    }catch(e){
+        console.error('Chainlink history error:',e);
+    }
+    
+    // Fallback to Binance if Chainlink feed unavailable
+    try{
+        const r=await fetch('https://api.binance.com/api/v3/klines?symbol=BTCUSDT&interval=5m&limit=100');
+        const d=await r.json();
+        if(d&&Array.isArray(d)&&d.length>0){
+            pH=d.map(k=>({t:k[0],p:parseFloat(k[4]),o:parseFloat(k[1]),h:parseFloat(k[2]),l:parseFloat(k[3]),v:parseFloat(k[5])}));
             lp=pH[pH.length-1].p;
             document.getElementById('ls').textContent='LIVE';
             document.getElementById('ls').parentElement.style.background='var(--bull-d)';
@@ -256,7 +297,7 @@ async function fP(){
             uUI();uC();aT();mP();cLP();
         }
     }catch(e){
-        console.error(e);
+        console.error('Fallback error:',e);
         document.getElementById('ls').textContent='ERROR';
         document.getElementById('ls').parentElement.style.background='var(--bear-d)';
         document.getElementById('ls').parentElement.style.color='var(--bear)';
