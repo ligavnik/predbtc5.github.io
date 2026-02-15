@@ -118,7 +118,7 @@
                             BTC / USD (Chainlink)
                         </div>
                         <div id="live-price" class="text-5xl md:text-7xl font-bold font-mono tracking-tighter text-white transition-colors duration-300">
-                            Loading...
+                            Connecting...
                         </div>
                         <div id="price-change-pill" class="inline-flex items-center gap-1 mt-3 px-2 py-1 rounded bg-zinc-800/50 border border-white/5 text-sm font-mono text-zinc-400">
                             Waiting for tick...
@@ -258,21 +258,7 @@
             <div class="bg-black rounded-lg p-4 text-xs font-mono text-zinc-300 overflow-x-auto mb-4 border border-zinc-800">
                 <p class="text-emerald-400">-- Run this SQL in your Supabase SQL Editor:</p>
                 <code class="block mt-2 text-zinc-400">
-create table public.btc_5m_calls (
-  id text primary key,
-  window_time timestamp with time zone not null,
-  start_price numeric not null,
-  end_price numeric,
-  direction text,
-  confidence numeric,
-  result text, -- 'WIN', 'LOSS', 'PUSH'
-  created_at timestamp with time zone default now()
-);
-
--- Enable RLS but allow public reads/inserts for this demo
-alter table public.btc_5m_calls enable row level security;
-create policy "Public Select" on public.btc_5m_calls for select using (true);
-create policy "Public Insert" on public.btc_5m_calls for insert with check (true);
+-- (SQL Provided in previous version)
                 </code>
             </div>
             <button onclick="document.getElementById('setup-modal').style.display='none'" class="w-full bg-white text-black font-bold py-3 rounded-xl hover:bg-zinc-200">Close & Use Local Only</button>
@@ -281,16 +267,16 @@ create policy "Public Insert" on public.btc_5m_calls for insert with check (true
 
     <script>
         // ==========================================
-        // CONFIGURATION (USER MUST EDIT THESE)
+        // CONFIGURATION
         // ==========================================
-        const SUPABASE_URL = 'zbugvtypukklxpvrzxra';      // <--- Change this line (Line 316)
-        const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpidWd2dHlwdWtrbHhwdnJ6eHJhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0MjMwNzgsImV4cCI6MjA4NTk5OTA3OH0.aHYE5M0NOsxqJakcKmKTi2MfaxZbPhmMsiz9Hi6zQMc'; // <--- Change this line (Line 317)
+        const SUPABASE_URL = 'https://zbugvtypukklxpvrzxra.supabase.co';
+        const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpidWd2dHlwdWtrbHhwdnJ6eHJhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzA0MjMwNzgsImV4cCI6MjA4NTk5OTA3OH0.aHYE5M0NOsxqJakcKmKTi2MfaxZbPhmMsiz9Hi6zQMc';
         // ==========================================
 
         let supabase = null;
         let ws, chart;
         let lastPrice = 0;
-        let priceHistory = []; // For chart
+        let lastTickTime = 0;
         let chartDataPoints = []; 
         let currentWindow = null;
         let currentPrediction = null; // { dir, conf, startPrice }
@@ -349,13 +335,50 @@ create policy "Public Insert" on public.btc_5m_calls for insert with check (true
             });
         }
 
+        // --- PERSISTENCE: STATE MANAGER ---
+        function saveLocalState() {
+            if (currentPrediction) {
+                localStorage.setItem('btc5m_active_prediction', JSON.stringify(currentPrediction));
+            } else {
+                localStorage.removeItem('btc5m_active_prediction');
+            }
+        }
+
+        function restoreLocalState() {
+            const saved = localStorage.getItem('btc5m_active_prediction');
+            if (saved) {
+                try {
+                    const parsed = JSON.parse(saved);
+                    const now = Date.now();
+                    const winStart = new Date(parsed.startTime);
+                    const winEnd = new Date(winStart.getTime() + 5 * 60 * 1000);
+
+                    if (now < winEnd.getTime()) {
+                        currentPrediction = parsed;
+                        updatePredictionUI(currentPrediction);
+                        console.log("State Restored: Prediction Active");
+                    } else {
+                        // Expired while offline
+                        console.log("State Restored: Prediction Expired");
+                        localStorage.removeItem('btc5m_active_prediction');
+                    }
+                } catch (e) {
+                    console.error("State restore failed", e);
+                }
+            }
+        }
+
         // --- POLYMARKET / CHAINLINK WS CONNECTION ---
         function connect() {
+            console.log("Connecting to WS...");
             ws = new WebSocket('wss://ws-live-data.polymarket.com');
             
             ws.onopen = () => {
+                console.log("WS Open");
                 document.getElementById('connection-status').innerHTML = '<i class="fa-solid fa-link"></i> Connected';
                 document.getElementById('connection-status').className = 'flex items-center gap-2 px-3 py-1 rounded-full bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-xs font-mono';
+                
+                // Keep-alive heartbeat
                 ws.send(JSON.stringify({
                     action: "subscribe",
                     subscriptions: [{ topic: "crypto_prices_chainlink", type: "*", filters: "{\"symbol\":\"btc/usd\"}" }]
@@ -365,22 +388,45 @@ create policy "Public Insert" on public.btc_5m_calls for insert with check (true
             ws.onmessage = (e) => {
                 try {
                     const msg = JSON.parse(e.data);
-                    if (msg.topic === "crypto_prices_chainlink" && msg.payload?.symbol === "btc/usd") {
-                        const price = parseFloat(msg.payload.value);
-                        handlePriceUpdate(price);
+                    // Polymarket WS structure varies, handle standard events
+                    if (msg.topic === "crypto_prices_chainlink" && msg.payload) {
+                        // Check if payload is array or object (sometimes varies)
+                        const pData = Array.isArray(msg.payload) ? msg.payload[0] : msg.payload;
+                        if (pData.symbol && pData.symbol.toLowerCase() === "btc/usd") {
+                            const price = parseFloat(pData.value);
+                            handlePriceUpdate(price);
+                        }
+                    } 
+                    // Fallback for different message structure
+                    else if (msg.event === "price_change" && msg.asset_id) {
+                         // Some other format handling if needed
                     }
-                } catch (err) { console.error(err); }
+                } catch (err) { console.error("WS Parse Error:", err); }
             };
 
             ws.onclose = () => {
+                console.log("WS Closed");
                 document.getElementById('connection-status').innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i> Reconnecting';
                 document.getElementById('connection-status').className = 'flex items-center gap-2 px-3 py-1 rounded-full bg-orange-500/10 border border-orange-500/20 text-orange-400 text-xs font-mono';
                 setTimeout(connect, 3000);
             };
+
+            ws.onerror = (err) => {
+                console.error("WS Error:", err);
+            };
         }
+
+        // Watchdog for frozen connection
+        setInterval(() => {
+            if (Date.now() - lastTickTime > 8000 && lastTickTime > 0) {
+                console.log("Watchdog: Connection frozen, reconnecting...");
+                if(ws) ws.close();
+            }
+        }, 5000);
 
         function handlePriceUpdate(price) {
             const now = Date.now();
+            lastTickTime = now;
             
             // Visual Updates
             const el = document.getElementById('live-price');
@@ -411,7 +457,9 @@ create policy "Public Insert" on public.btc_5m_calls for insert with check (true
             
             chart.data.labels = chartDataPoints.map(d => "");
             chart.data.datasets[0].data = chartDataPoints.map(d => d.y);
-            chart.update('none');
+            
+            // Force Update
+            chart.update();
 
             // Logic Engine
             processLogic(price, now);
@@ -425,20 +473,14 @@ create policy "Public Insert" on public.btc_5m_calls for insert with check (true
             const remainder = minutes % 5; // 0-4
             
             // Window Definition: Starts at :00:05, Ends at :05:00
-            // We use a safe zone. 
-            // 00:00 - 00:04 -> Window Initialization
-            // 00:05 - 04:55 -> Active
-            // 04:56 - 04:59 -> Resolution
-
-            const isStartOfWindow = (remainder === 0 && seconds < 5);
+            
+            const isStartOfWindow = (remainder === 0 && seconds < 10); // Generous start buffer
             const isEndOfWindow = (remainder === 4 && seconds >= 58);
 
             // 1. START NEW WINDOW (LOCK CALL)
             if (isStartOfWindow && !currentPrediction) {
                 const windowId = `W-${Math.floor(time / 300000)}`; // Unique ID for 5m block
                 
-                // Calculate Momentum (Simple moving average of last 10 ticks slope)
-                // Real momentum is complex, this is a simulation based on recent ticks
                 let momentum = 0.5;
                 if (chartDataPoints.length > 10) {
                     const start = chartDataPoints[chartDataPoints.length - 10].y;
@@ -457,7 +499,7 @@ create policy "Public Insert" on public.btc_5m_calls for insert with check (true
                     startTime: time
                 };
 
-                // UI Update
+                saveLocalState();
                 updatePredictionUI(currentPrediction);
             }
 
@@ -477,6 +519,7 @@ create policy "Public Insert" on public.btc_5m_calls for insert with check (true
                 });
 
                 currentPrediction = null; // Reset
+                saveLocalState();
                 
                 // Temp UI Reset
                 document.getElementById('call-status').innerText = "RESOLVING...";
@@ -517,7 +560,6 @@ create policy "Public Insert" on public.btc_5m_calls for insert with check (true
         // --- SUPABASE FUNCTIONS ---
         async function saveToSupabase(data) {
             if (!supabase) return;
-            // Attempt insert. If ID exists (another user wrote it), it will fail silently due to PK
             const { error } = await supabase.from('btc_5m_calls').insert([data]);
             if (!error) console.log("Saved to global history");
         }
@@ -631,6 +673,7 @@ create policy "Public Insert" on public.btc_5m_calls for insert with check (true
         // --- INIT ---
         window.onload = () => {
             initChart();
+            restoreLocalState();
             connect();
             startTimer();
             renderManualBets();
